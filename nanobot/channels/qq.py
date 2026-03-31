@@ -1,19 +1,35 @@
-"""QQ channel implementation using botpy SDK.
+"""
+QQ 频道实现，使用 botpy SDK。
 
-Inbound:
-- Parse QQ botpy messages (C2C / Group)
-- Download attachments to media dir using chunked streaming write (memory-safe)
-- Publish to Nanobot bus via BaseChannel._handle_message()
-- Content includes a clear, actionable "Received files:" list with local paths
+该模块实现了 nanobot 与 QQ 机器人的集成，支持：
+- 私聊（C2C）和群聊消息
+- 媒体附件下载和上传
+- 富媒体消息发送（图片、文件）
 
-Outbound:
-- Send attachments (msg.media) first via QQ rich media API (base64 upload + msg_type=7)
-- Then send text (plain or markdown)
-- msg.media supports local paths, file:// paths, and http(s) URLs
+入站流程：
+    - 解析 QQ botpy 消息（私聊/群聊）
+    - 使用分块流式写入下载附件（内存安全）
+    - 通过 BaseChannel._handle_message() 发布到消息总线
+    - 内容包含清晰的"已接收文件"列表和本地路径
 
-Notes:
-- QQ restricts many audio/video formats. We conservatively classify as image vs file.
-- Attachment structures differ across botpy versions; we try multiple field candidates.
+出站流程：
+    - 先发送附件（msg.media）通过 QQ 富媒体 API（base64 上传 + msg_type=7）
+    - 然后发送文本（纯文本或 Markdown）
+    - msg.media 支持本地路径、file:// 路径和 http(s) URL
+
+注意事项：
+    - QQ 限制多种音频/视频格式，保守分类为图片或文件
+    - 附件结构在 botpy 版本间有所不同，尝试多个字段候选
+
+依赖：
+    - qq-botpy: QQ 机器人 Python SDK
+
+配置说明：
+    - app_id: QQ 机器人应用 ID
+    - secret: QQ 机器人应用密钥
+    - allow_from: 允许访问的用户 ID 列表
+    - msg_format: 消息格式 ("plain" 或 "markdown")
+    - media_dir: 入站附件保存目录
 """
 
 from __future__ import annotations
@@ -41,15 +57,15 @@ from nanobot.security.network import validate_url_target
 
 try:
     from nanobot.config.paths import get_media_dir
-except Exception:  # pragma: no cover
-    get_media_dir = None  # type: ignore
+except Exception:
+    get_media_dir = None
 
 try:
     import botpy
     from botpy.http import Route
 
     QQ_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except ImportError:
     QQ_AVAILABLE = False
     botpy = None
     Route = None
@@ -59,8 +75,6 @@ if TYPE_CHECKING:
     from botpy.types.message import Media
 
 
-# QQ rich media file_type: 1=image, 4=file
-# (2=voice, 3=video are restricted; we only use image vs file)
 QQ_FILE_TYPE_IMAGE = 1
 QQ_FILE_TYPE_FILE = 4
 
@@ -77,12 +91,19 @@ _IMAGE_EXTS = {
     ".svg",
 }
 
-# Replace unsafe characters with "_", keep Chinese and common safe punctuation.
 _SAFE_NAME_RE = re.compile(r"[^\w.\-()\[\]（）【】\u4e00-\u9fff]+", re.UNICODE)
 
 
 def _sanitize_filename(name: str) -> str:
-    """Sanitize filename to avoid traversal and problematic chars."""
+    """
+    清理文件名，避免路径遍历和问题字符。
+
+    参数：
+        name: 原始文件名
+
+    返回：
+        清理后的安全文件名
+    """
     name = (name or "").strip()
     name = Path(name).name
     name = _SAFE_NAME_RE.sub("_", name).strip("._ ")
@@ -90,11 +111,20 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _is_image_name(name: str) -> bool:
+    """检查文件名是否为图片类型。"""
     return Path(name).suffix.lower() in _IMAGE_EXTS
 
 
 def _guess_send_file_type(filename: str) -> int:
-    """Conservative send type: images -> 1, else -> 4."""
+    """
+    保守估计发送类型：图片返回 1，其他返回 4。
+
+    参数：
+        filename: 文件名
+
+    返回：
+        QQ 文件类型常量
+    """
     ext = Path(filename).suffix.lower()
     mime, _ = mimetypes.guess_type(filename)
     if ext in _IMAGE_EXTS or (mime and mime.startswith("image/")):
@@ -103,57 +133,92 @@ def _guess_send_file_type(filename: str) -> int:
 
 
 def _make_bot_class(channel: QQChannel) -> type[botpy.Client]:
-    """Create a botpy Client subclass bound to the given channel."""
+    """
+    创建绑定到指定频道的 botpy Client 子类。
+
+    参数：
+        channel: QQChannel 实例
+
+    返回：
+        botpy.Client 子类
+    """
     intents = botpy.Intents(public_messages=True, direct_message=True)
 
     class _Bot(botpy.Client):
         def __init__(self):
-            # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs
             super().__init__(intents=intents, ext_handlers=False)
 
         async def on_ready(self):
+            """机器人就绪回调。"""
             logger.info("QQ bot ready: {}", self.robot.name)
 
         async def on_c2c_message_create(self, message: C2CMessage):
+            """私聊消息回调。"""
             await channel._on_message(message, is_group=False)
 
         async def on_group_at_message_create(self, message: GroupMessage):
+            """群聊 @ 消息回调。"""
             await channel._on_message(message, is_group=True)
 
         async def on_direct_message_create(self, message):
+            """直接消息回调。"""
             await channel._on_message(message, is_group=False)
 
     return _Bot
 
 
 class QQConfig(Base):
-    """QQ channel configuration using botpy SDK."""
+    """
+    QQ 频道配置模型，使用 botpy SDK。
+
+    属性：
+        enabled: 是否启用此频道
+        app_id: QQ 机器人应用 ID
+        secret: QQ 机器人应用密钥
+        allow_from: 允许访问的用户 ID 列表
+        msg_format: 消息格式 ("plain" 或 "markdown")
+        media_dir: 入站附件保存目录（为空则使用 nanobot 默认目录）
+        download_chunk_size: 下载分块大小（字节）
+        download_max_bytes: 最大下载大小（字节）
+    """
 
     enabled: bool = False
     app_id: str = ""
     secret: str = ""
     allow_from: list[str] = Field(default_factory=list)
     msg_format: Literal["plain", "markdown"] = "plain"
-
-    # Optional: directory to save inbound attachments. If empty, use nanobot get_media_dir("qq").
     media_dir: str = ""
-
-    # Download tuning
-    download_chunk_size: int = 1024 * 256  # 256KB
-    download_max_bytes: int = 1024 * 1024 * 200  # 200MB safety limit
+    download_chunk_size: int = 1024 * 256
+    download_max_bytes: int = 1024 * 1024 * 200
 
 
 class QQChannel(BaseChannel):
-    """QQ channel using botpy SDK with WebSocket connection."""
+    """
+    QQ 频道实现，使用 botpy SDK 和 WebSocket 连接。
+
+    支持私聊（C2C）和群聊消息，支持媒体附件。
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
+    """
 
     name = "qq"
     display_name = "QQ"
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
+        """返回默认配置字典。"""
         return QQConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
+        """
+        初始化 QQ 频道实例。
+
+        参数：
+            config: 频道配置
+            bus: 消息总线实例
+        """
         if isinstance(config, dict):
             config = QQConfig.model_validate(config)
         super().__init__(config, bus)
@@ -163,17 +228,18 @@ class QQChannel(BaseChannel):
         self._http: aiohttp.ClientSession | None = None
 
         self._processed_ids: deque[str] = deque(maxlen=1000)
-        self._msg_seq: int = 1  # used to avoid QQ API dedup
+        self._msg_seq: int = 1
         self._chat_type_cache: dict[str, str] = {}
 
         self._media_root: Path = self._init_media_root()
 
-    # ---------------------------
-    # Lifecycle
-    # ---------------------------
-
     def _init_media_root(self) -> Path:
-        """Choose a directory for saving inbound attachments."""
+        """
+        选择入站附件保存目录。
+
+        返回：
+            媒体目录路径
+        """
         if self.config.media_dir:
             root = Path(self.config.media_dir).expanduser()
         elif get_media_dir:
@@ -189,7 +255,15 @@ class QQChannel(BaseChannel):
         return root
 
     async def start(self) -> None:
-        """Start the QQ bot with auto-reconnect loop."""
+        """
+        启动 QQ 机器人，使用自动重连循环。
+
+        启动流程：
+            1. 检查 SDK 可用性和配置完整性
+            2. 创建 HTTP 客户端
+            3. 创建 botpy 客户端
+            4. 进入运行循环
+        """
         if not QQ_AVAILABLE:
             logger.error("QQ SDK not installed. Run: pip install qq-botpy")
             return
@@ -206,7 +280,7 @@ class QQChannel(BaseChannel):
         await self._run_bot()
 
     async def _run_bot(self) -> None:
-        """Run the bot connection with auto-reconnect."""
+        """运行机器人连接，支持自动重连。"""
         while self._running:
             try:
                 await self._client.start(appid=self.config.app_id, secret=self.config.secret)
@@ -217,7 +291,7 @@ class QQChannel(BaseChannel):
                 await asyncio.sleep(5)
 
     async def stop(self) -> None:
-        """Stop bot and cleanup resources."""
+        """停止机器人并清理资源。"""
         self._running = False
         if self._client:
             try:
@@ -235,12 +309,17 @@ class QQChannel(BaseChannel):
 
         logger.info("QQ bot stopped")
 
-    # ---------------------------
-    # Outbound (send)
-    # ---------------------------
-
     async def send(self, msg: OutboundMessage) -> None:
-        """Send attachments first, then text."""
+        """
+        发送消息，先发送附件再发送文本。
+
+        参数：
+            msg: 出站消息对象
+
+        处理流程：
+            1. 发送媒体附件
+            2. 发送文本内容
+        """
         if not self._client:
             logger.warning("QQ client not initialized")
             return
@@ -249,7 +328,6 @@ class QQChannel(BaseChannel):
         chat_type = self._chat_type_cache.get(msg.chat_id, "c2c")
         is_group = chat_type == "group"
 
-        # 1) Send media
         for media_ref in msg.media or []:
             ok = await self._send_media(
                 chat_id=msg.chat_id,
@@ -270,7 +348,6 @@ class QQChannel(BaseChannel):
                     content=f"[Attachment send failed: {filename}]",
                 )
 
-        # 2) Send text
         if msg.content and msg.content.strip():
             await self._send_text_only(
                 chat_id=msg.chat_id,
@@ -286,7 +363,15 @@ class QQChannel(BaseChannel):
         msg_id: str | None,
         content: str,
     ) -> None:
-        """Send a plain/markdown text message."""
+        """
+        发送纯文本/Markdown 消息。
+
+        参数：
+            chat_id: 聊天 ID
+            is_group: 是否为群聊
+            msg_id: 消息 ID（用于回复）
+            content: 消息内容
+        """
         if not self._client:
             return
 
@@ -314,7 +399,18 @@ class QQChannel(BaseChannel):
         msg_id: str | None,
         is_group: bool,
     ) -> bool:
-        """Read bytes -> base64 upload -> msg_type=7 send."""
+        """
+        读取字节 -> base64 上传 -> msg_type=7 发送。
+
+        参数：
+            chat_id: 聊天 ID
+            media_ref: 媒体引用（路径或 URL）
+            msg_id: 消息 ID
+            is_group: 是否为群聊
+
+        返回：
+            发送成功返回 True
+        """
         if not self._client:
             return False
 
@@ -363,17 +459,23 @@ class QQChannel(BaseChannel):
             return False
 
     async def _read_media_bytes(self, media_ref: str) -> tuple[bytes | None, str | None]:
-        """Read bytes from http(s) or local file path; return (data, filename)."""
+        """
+        从 http(s) 或本地文件路径读取字节。
+
+        参数：
+            media_ref: 媒体引用（路径或 URL）
+
+        返回：
+            元组 (数据, 文件名)
+        """
         media_ref = (media_ref or "").strip()
         if not media_ref:
             return None, None
 
-        # Local file: plain path or file:// URI
         if not media_ref.startswith("http://") and not media_ref.startswith("https://"):
             try:
                 if media_ref.startswith("file://"):
                     parsed = urlparse(media_ref)
-                    # Windows: path in netloc; Unix: path in path
                     raw = parsed.path or parsed.netloc
                     local_path = Path(unquote(raw))
                 else:
@@ -389,7 +491,6 @@ class QQChannel(BaseChannel):
                 logger.warning("QQ outbound media read error ref={} err={}", media_ref, e)
                 return None, None
 
-        # Remote URL
         ok, err = validate_url_target(media_ref)
         if not ok:
             logger.warning("QQ outbound media URL validation failed url={} err={}", media_ref, err)
@@ -415,8 +516,6 @@ class QQChannel(BaseChannel):
             logger.warning("QQ outbound media download error url={} err={}", media_ref, e)
             return None, None
 
-    # https://github.com/tencent-connect/botpy/issues/198
-    # https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/send-receive/rich-media.html
     async def _post_base64file(
         self,
         chat_id: str,
@@ -426,7 +525,20 @@ class QQChannel(BaseChannel):
         file_name: str | None = None,
         srv_send_msg: bool = False,
     ) -> Media:
-        """Upload base64-encoded file and return Media object."""
+        """
+        上传 base64 编码文件并返回 Media 对象。
+
+        参数：
+            chat_id: 聊天 ID
+            is_group: 是否为群聊
+            file_type: 文件类型常量
+            file_data: base64 编码的文件数据
+            file_name: 文件名
+            srv_send_msg: 是否由服务器发送消息
+
+        返回：
+            Media 对象
+        """
         if not self._client:
             raise RuntimeError("QQ client not initialized")
 
@@ -447,12 +559,14 @@ class QQChannel(BaseChannel):
         route = Route("POST", endpoint, **{id_key: chat_id})
         return await self._client.api._http.request(route, json=payload)
 
-    # ---------------------------
-    # Inbound (receive)
-    # ---------------------------
-
     async def _on_message(self, data: C2CMessage | GroupMessage, is_group: bool = False) -> None:
-        """Parse inbound message, download attachments, and publish to the bus."""
+        """
+        解析入站消息，下载附件，并发布到消息总线。
+
+        参数：
+            data: 消息对象
+            is_group: 是否为群聊消息
+        """
         if data.id in self._processed_ids:
             return
         self._processed_ids.append(data.id)
@@ -470,12 +584,9 @@ class QQChannel(BaseChannel):
 
         content = (data.content or "").strip()
 
-        # the data used by tests don't contain attachments property
-        # so we use getattr with a default of [] to avoid AttributeError in tests
         attachments = getattr(data, "attachments", None) or []
         media_paths, recv_lines, att_meta = await self._handle_attachments(attachments)
 
-        # Compose content that always contains actionable saved paths
         if recv_lines:
             tag = "[Image]" if any(_is_image_name(Path(p).name) for p in media_paths) else "[File]"
             file_block = "Received files:\n" + "\n".join(recv_lines)
@@ -499,7 +610,15 @@ class QQChannel(BaseChannel):
         self,
         attachments: list[BaseMessage._Attachments],
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-        """Extract, download (chunked), and format attachments for agent consumption."""
+        """
+        提取、下载（分块）并格式化附件供 Agent 使用。
+
+        参数：
+            attachments: 附件列表
+
+        返回：
+            元组 (媒体路径列表, 接收行列表, 附件元数据列表)
+        """
         media_paths: list[str] = []
         recv_lines: list[str] = []
         att_meta: list[dict[str, Any]] = []
@@ -537,11 +656,19 @@ class QQChannel(BaseChannel):
         url: str,
         filename_hint: str = "",
     ) -> str | None:
-        """Download an inbound attachment using streaming chunk write.
+        """
+        使用流式分块写入下载入站附件。
 
-        Uses chunked streaming to avoid loading large files into memory.
-        Enforces a max download size and writes to a .part temp file
-        that is atomically renamed on success.
+        使用分块流式写入避免将大文件加载到内存。
+        强制执行最大下载大小，写入 .part 临时文件，
+        成功后原子重命名。
+
+        参数：
+            url: 下载 URL
+            filename_hint: 文件名提示
+
+        返回：
+            本地文件路径，失败返回 None
         """
         if not self._http:
             self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
@@ -562,7 +689,6 @@ class QQChannel(BaseChannel):
 
                 ctype = (resp.headers.get("Content-Type") or "").lower()
 
-                # Infer extension: url -> filename_hint -> content-type -> fallback
                 ext = Path(urlparse(url).path).suffix
                 if not ext:
                     ext = Path(filename_hint).suffix
@@ -593,7 +719,6 @@ class QQChannel(BaseChannel):
 
                 tmp_path = target.with_suffix(target.suffix + ".part")
 
-                # Stream write
                 downloaded = 0
                 chunk_size = max(1024, int(self.config.download_chunk_size or 262144))
                 max_bytes = max(
@@ -602,7 +727,7 @@ class QQChannel(BaseChannel):
 
                 def _open_tmp():
                     tmp_path.parent.mkdir(parents=True, exist_ok=True)
-                    return open(tmp_path, "wb")  # noqa: SIM115
+                    return open(tmp_path, "wb")
 
                 f = await asyncio.to_thread(_open_tmp)
                 try:
@@ -621,9 +746,8 @@ class QQChannel(BaseChannel):
                 finally:
                     await asyncio.to_thread(f.close)
 
-                # Atomic rename
                 await asyncio.to_thread(os.replace, tmp_path, target)
-                tmp_path = None  # mark as moved
+                tmp_path = None
                 logger.info("QQ file saved: {}", str(target))
                 return str(target)
 
@@ -631,7 +755,6 @@ class QQChannel(BaseChannel):
             logger.error("QQ download error: {}", e)
             return None
         finally:
-            # Cleanup partial file
             if tmp_path is not None:
                 try:
                     tmp_path.unlink(missing_ok=True)

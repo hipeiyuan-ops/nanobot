@@ -1,4 +1,19 @@
-"""Built-in slash command handlers."""
+"""
+内置斜杠命令处理器模块。
+
+该模块实现了 nanobot 的内置命令处理逻辑：
+    - /stop: 取消当前会话的所有活动任务和子代理
+    - /restart: 原地重启进程
+    - /status: 显示机器人状态信息
+    - /new: 开始新的对话会话
+    - /help: 显示可用命令列表
+
+命令处理流程：
+    1. 命令路由器匹配命令字符串
+    2. 创建 CommandContext 上下文对象
+    3. 调用对应的命令处理函数
+    4. 返回 OutboundMessage 响应
+"""
 
 from __future__ import annotations
 
@@ -13,7 +28,21 @@ from nanobot.utils.helpers import build_status_content
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
-    """Cancel all active tasks and subagents for the session."""
+    """
+    取消会话的所有活动任务和子代理。
+
+    参数：
+        ctx: 命令上下文对象
+
+    返回：
+        包含取消任务数量的出站消息
+
+    处理流程：
+        1. 从活动任务列表获取会话任务
+        2. 取消所有未完成的任务
+        3. 取消会话关联的子代理
+        4. 返回取消统计
+    """
     loop = ctx.loop
     msg = ctx.msg
     tasks = loop._active_tasks.pop(msg.session_key, [])
@@ -30,7 +59,19 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
-    """Restart the process in-place via os.execv."""
+    """
+    通过 os.execv 原地重启进程。
+
+    参数：
+        ctx: 命令上下文对象
+
+    返回：
+        重启提示消息
+
+    注意：
+        使用 os.execv 实现原地重启，保持相同的命令行参数。
+        延迟 1 秒后执行，以便先返回响应消息。
+    """
     msg = ctx.msg
 
     async def _do_restart():
@@ -42,7 +83,24 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:
-    """Build an outbound status message for a session."""
+    """
+    构建会话的状态消息。
+
+    参数：
+        ctx: 命令上下文对象
+
+    返回：
+        包含状态信息的出站消息
+
+    状态信息包括：
+        - 版本号
+        - 当前模型
+        - 运行时间
+        - Token 使用量
+        - 上下文窗口大小
+        - 会话消息数量
+        - 上下文 Token 估算
+    """
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     ctx_est = 0
@@ -67,7 +125,22 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session."""
+    """
+    开始新的对话会话。
+
+    参数：
+        ctx: 命令上下文对象
+
+    返回：
+        新会话开始提示消息
+
+    处理流程：
+        1. 获取当前会话
+        2. 提取未合并的消息快照
+        3. 清空会话
+        4. 保存并使缓存失效
+        5. 后台归档旧消息
+    """
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
@@ -83,7 +156,15 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
-    """Return available slash commands."""
+    """
+    返回可用的斜杠命令列表。
+
+    参数：
+        ctx: 命令上下文对象
+
+    返回：
+        包含命令列表的出站消息
+    """
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -93,7 +174,12 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 
 
 def build_help_text() -> str:
-    """Build canonical help text shared across channels."""
+    """
+    构建跨频道共享的标准帮助文本。
+
+    返回：
+        格式化的帮助文本字符串
+    """
     lines = [
         "🐈 nanobot commands:",
         "/new — Start a new conversation",
@@ -106,7 +192,18 @@ def build_help_text() -> str:
 
 
 def register_builtin_commands(router: CommandRouter) -> None:
-    """Register the default set of slash commands."""
+    """
+    注册默认的斜杠命令集。
+
+    参数：
+        router: 命令路由器实例
+
+    注册的命令：
+        - 优先级命令（在调度锁之前处理）：
+            - /stop, /restart, /status
+        - 精确匹配命令：
+            - /new, /status, /help
+    """
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)

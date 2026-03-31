@@ -1,4 +1,22 @@
-"""CLI commands for nanobot."""
+"""
+CLI 命令模块，提供 nanobot 命令行工具的所有子命令。
+
+该模块定义了以下 CLI 命令：
+    - onboard: 交互式配置向导，引导用户完成首次配置
+    - serve: 启动 Agent 服务，监听消息并响应
+    - gateway: 启动网关模式，提供 HTTP API 接口
+    - agent: 启动单次 Agent 对话
+    - channels: 列出所有可用的聊天频道
+    - plugins: 列出所有已安装的插件
+    - status: 显示系统状态信息
+    - provider: 显示 Provider 配置信息
+
+使用方式：
+    nanobot onboard --wizard
+    nanobot serve
+    nanobot gateway
+    nanobot agent "你好"
+"""
 
 import asyncio
 from contextlib import contextmanager, nullcontext

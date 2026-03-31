@@ -1,4 +1,24 @@
-"""DingTalk/DingDing channel implementation using Stream Mode."""
+"""
+钉钉频道实现，使用 Stream Mode 进行消息收发。
+
+该模块实现了 nanobot 与钉钉机器人的集成，支持单聊和群聊消息。
+使用 dingtalk-stream SDK 通过 WebSocket 接收消息，使用 HTTP API 发送消息。
+
+主要功能：
+    - 支持文本、图片、文件、富文本等多种消息类型
+    - 支持单聊和群聊消息处理
+    - 支持媒体文件上传和下载
+    - 自动管理 Access Token 的获取和刷新
+
+依赖：
+    - dingtalk-stream: 钉钉 Stream Mode SDK
+    - httpx: 异步 HTTP 客户端
+
+配置说明：
+    - client_id: 钉钉应用的 Client ID (AppKey)
+    - client_secret: 钉钉应用的 Client Secret (AppSecret)
+    - allow_from: 允许访问的用户 ID 列表
+"""
 
 import asyncio
 import json
@@ -31,7 +51,6 @@ try:
     DINGTALK_AVAILABLE = True
 except ImportError:
     DINGTALK_AVAILABLE = False
-    # Fallback so class definitions don't crash at module level
     CallbackHandler = object  # type: ignore[assignment,misc]
     CallbackMessage = None  # type: ignore[assignment,misc]
     AckMessage = None  # type: ignore[assignment,misc]
@@ -40,21 +59,40 @@ except ImportError:
 
 class NanobotDingTalkHandler(CallbackHandler):
     """
-    Standard DingTalk Stream SDK Callback Handler.
-    Parses incoming messages and forwards them to the Nanobot channel.
+    钉钉 Stream SDK 回调处理器。
+
+    解析传入的消息并转发给 Nanobot 频道进行处理。
+    支持处理文本、图片、文件、富文本等多种消息类型。
+
+    属性：
+        channel: 关联的 DingTalkChannel 实例
     """
 
     def __init__(self, channel: "DingTalkChannel"):
+        """初始化回调处理器。"""
         super().__init__()
         self.channel = channel
 
     async def process(self, message: CallbackMessage):
-        """Process incoming stream message."""
+        """
+        处理传入的流消息。
+
+        参数：
+            message: 钉钉 Stream SDK 的回调消息对象
+
+        返回：
+            确认消息元组 (status, message)
+
+        处理流程：
+            1. 使用 SDK 的 ChatbotMessage 解析消息
+            2. 提取文本内容（支持语音识别结果）
+            3. 处理图片、文件、富文本等媒体消息
+            4. 下载媒体文件到本地
+            5. 将消息转发给频道处理
+        """
         try:
-            # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(message.data)
 
-            # Extract text content; fall back to raw dict if SDK object is empty
             content = ""
             if chatbot_msg.text:
                 content = chatbot_msg.text.content.strip()
@@ -63,7 +101,6 @@ class NanobotDingTalkHandler(CallbackHandler):
             if not content:
                 content = message.data.get("text", {}).get("content", "").strip()
 
-            # Handle file/image messages
             file_paths = []
             if chatbot_msg.message_type == "picture" and chatbot_msg.image_content:
                 download_code = chatbot_msg.image_content.download_code
@@ -124,8 +161,6 @@ class NanobotDingTalkHandler(CallbackHandler):
 
             logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
 
-            # Forward to Nanobot via _on_message (non-blocking).
-            # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
                 self.channel._on_message(
                     content,
@@ -142,12 +177,21 @@ class NanobotDingTalkHandler(CallbackHandler):
 
         except Exception as e:
             logger.error("Error processing DingTalk message: {}", e)
-            # Return OK to avoid retry loop from DingTalk server
             return AckMessage.STATUS_OK, "Error"
 
 
 class DingTalkConfig(Base):
-    """DingTalk channel configuration using Stream mode."""
+    """
+    钉钉频道配置模型。
+
+    使用 Stream Mode 连接钉钉服务器，需要配置应用的 Client ID 和 Secret。
+
+    属性：
+        enabled: 是否启用此频道
+        client_id: 钉钉应用的 Client ID (AppKey)
+        client_secret: 钉钉应用的 Client Secret (AppSecret)
+        allow_from: 允许访问的用户 ID 列表，空列表拒绝所有，["*"] 允许所有
+    """
 
     enabled: bool = False
     client_id: str = ""
@@ -157,13 +201,21 @@ class DingTalkConfig(Base):
 
 class DingTalkChannel(BaseChannel):
     """
-    DingTalk channel using Stream Mode.
+    钉钉频道实现，使用 Stream Mode。
 
-    Uses WebSocket to receive events via `dingtalk-stream` SDK.
-    Uses direct HTTP API to send messages (SDK is mainly for receiving).
+    通过 dingtalk-stream SDK 的 WebSocket 接收事件消息，
+    通过直接 HTTP API 发送消息。
 
-    Supports both private (1:1) and group chats.
-    Group chat_id is stored with a "group:" prefix to route replies back.
+    支持单聊和群聊：
+        - 单聊：chat_id 为用户 ID
+        - 群聊：chat_id 以 "group:" 前缀存储，用于路由回复
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
+        _IMAGE_EXTS: 支持的图片扩展名集合
+        _AUDIO_EXTS: 支持的音频扩展名集合
+        _VIDEO_EXTS: 支持的视频扩展名集合
     """
 
     name = "dingtalk"
@@ -174,9 +226,17 @@ class DingTalkChannel(BaseChannel):
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
+        """返回默认配置字典。"""
         return DingTalkConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
+        """
+        初始化钉钉频道实例。
+
+        参数：
+            config: 频道配置
+            bus: 消息总线实例
+        """
         if isinstance(config, dict):
             config = DingTalkConfig.model_validate(config)
         super().__init__(config, bus)
@@ -184,15 +244,24 @@ class DingTalkChannel(BaseChannel):
         self._client: Any = None
         self._http: httpx.AsyncClient | None = None
 
-        # Access Token management for sending messages
         self._access_token: str | None = None
         self._token_expiry: float = 0
 
-        # Hold references to background tasks to prevent GC
         self._background_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
-        """Start the DingTalk bot with Stream Mode."""
+        """
+        启动钉钉机器人，使用 Stream Mode。
+
+        初始化 Stream Client 并注册消息处理器，进入消息接收循环。
+        支持自动重连机制。
+
+        启动流程：
+            1. 检查 SDK 可用性和配置完整性
+            2. 创建 HTTP 客户端和 Stream Client
+            3. 注册消息回调处理器
+            4. 进入消息接收循环，支持断线重连
+        """
         try:
             if not DINGTALK_AVAILABLE:
                 logger.error(
@@ -214,13 +283,11 @@ class DingTalkChannel(BaseChannel):
             credential = Credential(self.config.client_id, self.config.client_secret)
             self._client = DingTalkStreamClient(credential)
 
-            # Register standard handler
             handler = NanobotDingTalkHandler(self)
             self._client.register_callback_handler(ChatbotMessage.TOPIC, handler)
 
             logger.info("DingTalk bot started with Stream Mode")
 
-            # Reconnect loop: restart stream if SDK exits or crashes
             while self._running:
                 try:
                     await self._client.start()
@@ -234,19 +301,29 @@ class DingTalkChannel(BaseChannel):
             logger.exception("Failed to start DingTalk channel: {}", e)
 
     async def stop(self) -> None:
-        """Stop the DingTalk bot."""
+        """
+        停止钉钉机器人。
+
+        关闭 HTTP 客户端并取消所有后台任务。
+        """
         self._running = False
-        # Close the shared HTTP client
         if self._http:
             await self._http.aclose()
             self._http = None
-        # Cancel outstanding background tasks
         for task in self._background_tasks:
             task.cancel()
         self._background_tasks.clear()
 
     async def _get_access_token(self) -> str | None:
-        """Get or refresh Access Token."""
+        """
+        获取或刷新 Access Token。
+
+        Access Token 用于调用钉钉 API 发送消息。
+        Token 会在过期前 60 秒自动刷新。
+
+        返回：
+            有效的 Access Token，失败返回 None
+        """
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
 
@@ -265,7 +342,6 @@ class DingTalkChannel(BaseChannel):
             resp.raise_for_status()
             res_data = resp.json()
             self._access_token = res_data.get("accessToken")
-            # Expire 60s early to be safe
             self._token_expiry = time.time() + int(res_data.get("expireIn", 7200)) - 60
             return self._access_token
         except Exception as e:
@@ -274,9 +350,19 @@ class DingTalkChannel(BaseChannel):
 
     @staticmethod
     def _is_http_url(value: str) -> bool:
+        """检查字符串是否为 HTTP/HTTPS URL。"""
         return urlparse(value).scheme in ("http", "https")
 
     def _guess_upload_type(self, media_ref: str) -> str:
+        """
+        根据文件扩展名猜测媒体上传类型。
+
+        参数：
+            media_ref: 媒体文件路径或 URL
+
+        返回：
+            媒体类型: "image", "voice", "video", 或 "file"
+        """
         ext = Path(urlparse(media_ref).path).suffix.lower()
         if ext in self._IMAGE_EXTS: return "image"
         if ext in self._AUDIO_EXTS: return "voice"
@@ -284,6 +370,16 @@ class DingTalkChannel(BaseChannel):
         return "file"
 
     def _guess_filename(self, media_ref: str, upload_type: str) -> str:
+        """
+        从媒体引用中提取或生成文件名。
+
+        参数：
+            media_ref: 媒体文件路径或 URL
+            upload_type: 媒体类型
+
+        返回：
+            文件名字符串
+        """
         name = os.path.basename(urlparse(media_ref).path)
         return name or {"image": "image.jpg", "voice": "audio.amr", "video": "video.mp4"}.get(upload_type, "file.bin")
 
@@ -291,6 +387,17 @@ class DingTalkChannel(BaseChannel):
         self,
         media_ref: str,
     ) -> tuple[bytes | None, str | None, str | None]:
+        """
+        读取媒体文件内容。
+
+        支持本地文件路径和 HTTP URL。
+
+        参数：
+            media_ref: 媒体文件路径或 URL
+
+        返回：
+            元组 (文件内容, 文件名, Content-Type)，失败返回 None
+        """
         if not media_ref:
             return None, None, None
 
@@ -337,6 +444,19 @@ class DingTalkChannel(BaseChannel):
         filename: str,
         content_type: str | None,
     ) -> str | None:
+        """
+        上传媒体文件到钉钉服务器。
+
+        参数：
+            token: Access Token
+            data: 文件内容字节
+            media_type: 媒体类型 (image/voice/video/file)
+            filename: 文件名
+            content_type: MIME 类型
+
+        返回：
+            媒体 ID，失败返回 None
+        """
         if not self._http:
             return None
         url = f"https://oapi.dingtalk.com/media/upload?access_token={token}&type={media_type}"
@@ -371,22 +491,32 @@ class DingTalkChannel(BaseChannel):
         msg_key: str,
         msg_param: dict[str, Any],
     ) -> bool:
+        """
+        发送批量消息（单聊或群聊）。
+
+        参数：
+            token: Access Token
+            chat_id: 目标聊天 ID（群聊以 "group:" 前缀）
+            msg_key: 消息类型键
+            msg_param: 消息参数字典
+
+        返回：
+            发送成功返回 True
+        """
         if not self._http:
             logger.warning("DingTalk HTTP client not initialized, cannot send")
             return False
 
         headers = {"x-acs-dingtalk-access-token": token}
         if chat_id.startswith("group:"):
-            # Group chat
             url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
             payload = {
                 "robotCode": self.config.client_id,
-                "openConversationId": chat_id[6:],  # Remove "group:" prefix,
+                "openConversationId": chat_id[6:],
                 "msgKey": msg_key,
                 "msgParam": json.dumps(msg_param, ensure_ascii=False),
             }
         else:
-            # Private chat
             url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
             payload = {
                 "robotCode": self.config.client_id,
@@ -414,6 +544,17 @@ class DingTalkChannel(BaseChannel):
             return False
 
     async def _send_markdown_text(self, token: str, chat_id: str, content: str) -> bool:
+        """
+        发送 Markdown 格式文本消息。
+
+        参数：
+            token: Access Token
+            chat_id: 目标聊天 ID
+            content: Markdown 内容
+
+        返回：
+            发送成功返回 True
+        """
         return await self._send_batch_message(
             token,
             chat_id,
@@ -422,6 +563,19 @@ class DingTalkChannel(BaseChannel):
         )
 
     async def _send_media_ref(self, token: str, chat_id: str, media_ref: str) -> bool:
+        """
+        发送媒体文件。
+
+        支持直接发送图片 URL 或上传媒体文件后发送。
+
+        参数：
+            token: Access Token
+            chat_id: 目标聊天 ID
+            media_ref: 媒体文件路径或 URL
+
+        返回：
+            发送成功返回 True
+        """
         media_ref = (media_ref or "").strip()
         if not media_ref:
             return True
@@ -462,7 +616,6 @@ class DingTalkChannel(BaseChannel):
             return False
 
         if upload_type == "image":
-            # Verified in production: sampleImageMsg accepts media_id in photoURL.
             ok = await self._send_batch_message(
                 token,
                 chat_id,
@@ -481,7 +634,17 @@ class DingTalkChannel(BaseChannel):
         )
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through DingTalk."""
+        """
+        发送消息通过钉钉。
+
+        参数：
+            msg: 出站消息对象
+
+        处理流程：
+            1. 获取 Access Token
+            2. 发送文本内容（Markdown 格式）
+            3. 发送媒体附件
+        """
         token = await self._get_access_token()
         if not token:
             return
@@ -494,7 +657,6 @@ class DingTalkChannel(BaseChannel):
             if ok:
                 continue
             logger.error("DingTalk media send failed for {}", media_ref)
-            # Send visible fallback so failures are observable by the user.
             filename = self._guess_filename(media_ref, self._guess_upload_type(media_ref))
             await self._send_markdown_text(
                 token,
@@ -510,10 +672,17 @@ class DingTalkChannel(BaseChannel):
         conversation_type: str | None = None,
         conversation_id: str | None = None,
     ) -> None:
-        """Handle incoming message (called by NanobotDingTalkHandler).
+        """
+        处理传入消息（由 NanobotDingTalkHandler 调用）。
 
-        Delegates to BaseChannel._handle_message() which enforces allow_from
-        permission checks before publishing to the bus.
+        委托给 BaseChannel._handle_message() 进行权限检查后发布到消息总线。
+
+        参数：
+            content: 消息内容
+            sender_id: 发送者 ID
+            sender_name: 发送者昵称
+            conversation_type: 会话类型（"2" 表示群聊）
+            conversation_id: 会话 ID
         """
         try:
             logger.info("DingTalk inbound: {} from {}", content, sender_name)
@@ -538,7 +707,22 @@ class DingTalkChannel(BaseChannel):
         filename: str,
         sender_id: str,
     ) -> str | None:
-        """Download a DingTalk file to the media directory, return local path."""
+        """
+        下载钉钉文件到媒体目录。
+
+        参数：
+            download_code: 钉钉文件下载码
+            filename: 保存的文件名
+            sender_id: 发送者 ID（用于组织目录结构）
+
+        返回：
+            本地文件路径，失败返回 None
+
+        处理流程：
+            1. 使用 download_code 换取临时下载 URL
+            2. 下载文件内容
+            3. 保存到媒体目录
+        """
         from nanobot.config.paths import get_media_dir
 
         try:
@@ -547,7 +731,6 @@ class DingTalkChannel(BaseChannel):
                 logger.error("DingTalk file download: no token or http client")
                 return None
 
-            # Step 1: Exchange downloadCode for a temporary download URL
             api_url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
             headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
             payload = {"downloadCode": download_code, "robotCode": self.config.client_id}
@@ -562,13 +745,11 @@ class DingTalkChannel(BaseChannel):
                 logger.error("DingTalk download URL not found in response: {}", result)
                 return None
 
-            # Step 2: Download the file content
             file_resp = await self._http.get(download_url, follow_redirects=True)
             if file_resp.status_code != 200:
                 logger.error("DingTalk file download failed: status={}", file_resp.status_code)
                 return None
 
-            # Save to media directory (accessible under workspace)
             download_dir = get_media_dir("dingtalk") / sender_id
             download_dir.mkdir(parents=True, exist_ok=True)
             file_path = download_dir / filename

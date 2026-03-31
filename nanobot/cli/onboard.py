@@ -1,4 +1,28 @@
-"""Interactive onboarding questionnaire for nanobot."""
+"""
+交互式配置向导模块，用于首次配置 nanobot。
+
+该模块提供了一个基于 questionary 的交互式配置界面，
+支持配置以下内容：
+    - LLM Provider：API 密钥、端点、模型选择
+    - Chat Channel：各聊天平台的连接设置
+    - Agent Settings：模型参数、温度、上下文窗口
+    - Gateway：服务器主机、端口配置
+    - Tools：工具开关和设置
+
+主要功能：
+    - 自动检测字段类型并生成适当的输入控件
+    - 支持敏感字段掩码（API Key 等）
+    - 支持嵌套 Pydantic 模型配置
+    - 支持模型自动完成和建议
+    - 支持上下文窗口自动填充
+    - 配置摘要预览
+
+使用方式：
+    from nanobot.cli.onboard import run_onboard
+    result = run_onboard()
+    if result.should_save:
+        save_config(result.config)
+"""
 
 import json
 import types

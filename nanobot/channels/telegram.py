@@ -1,4 +1,36 @@
-"""Telegram channel implementation using python-telegram-bot."""
+"""
+Telegram 频道实现，使用 python-telegram-bot 库。
+
+该模块实现了 nanobot 与 Telegram 的集成，支持：
+- 通过长轮询接收消息（无需 Webhook/公网 IP）
+- 支持私聊和群聊消息
+- 支持媒体附件（图片、语音、音频、文档）
+- 支持流式消息编辑（打字机效果）
+- 支持主题（Forum）消息
+- 支持消息回复和引用
+- 支持表情反应
+- 支持媒体组合（相册）
+
+主要功能：
+    - 长轮询消息接收
+    - Markdown 转 Telegram HTML 格式
+    - 表格转换为对齐文本
+    - 流式消息编辑
+    - 打字指示器
+    - 音频转录
+
+依赖：
+    - python-telegram-bot: Telegram Bot API Python 库
+
+配置说明：
+    - token: Telegram 机器人令牌
+    - allow_from: 允许访问的用户 ID 列表（支持 "id|username" 格式）
+    - proxy: 代理服务器地址
+    - reply_to_message: 是否回复原消息
+    - react_emoji: 收到消息时的表情反应
+    - group_policy: 群聊响应策略 ("open" 或 "mention")
+    - streaming: 是否启用流式输出
+"""
 
 from __future__ import annotations
 
@@ -24,12 +56,20 @@ from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
-TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
-TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram 消息字符限制
+TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # 回复上下文最大长度
 
 
 def _strip_md(s: str) -> str:
-    """Strip markdown inline formatting from text."""
+    """
+    移除 Markdown 内联格式标记。
+
+    参数：
+        s: 包含 Markdown 格式的文本
+
+    返回：
+        移除格式标记后的纯文本
+    """
     s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
     s = re.sub(r'__(.+?)__', r'\1', s)
     s = re.sub(r'~~(.+?)~~', r'\1', s)
@@ -38,7 +78,15 @@ def _strip_md(s: str) -> str:
 
 
 def _render_table_box(table_lines: list[str]) -> str:
-    """Convert markdown pipe-table to compact aligned text for <pre> display."""
+    """
+    将 Markdown 管道表格转换为紧凑对齐文本，用于 <pre> 显示。
+
+    参数：
+        table_lines: 表格行列表
+
+    返回：
+        对齐后的文本，使用 Unicode 制表符
+    """
 
     def dw(s: str) -> int:
         return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
@@ -71,12 +119,29 @@ def _render_table_box(table_lines: list[str]) -> str:
 
 def _markdown_to_telegram_html(text: str) -> str:
     """
-    Convert markdown to Telegram-safe HTML.
+    将 Markdown 转换为 Telegram 安全的 HTML 格式。
+
+    支持的 Markdown 特性：
+        - 代码块（```）
+        - 行内代码（`）
+        - 标题（#）
+        - 引用（>）
+        - 链接（[text](url)）
+        - 粗体（**text** 或 __text__）
+        - 斜体（_text_）
+        - 删除线（~~text~~）
+        - 列表（- 或 *）
+        - 表格（管道表格）
+
+    参数：
+        text: Markdown 文本
+
+    返回：
+        Telegram 兼容的 HTML 文本
     """
     if not text:
         return ""
 
-    # 1. Extract and protect code blocks (preserve content from other processing)
     code_blocks: list[str] = []
     def save_code_block(m: re.Match) -> str:
         code_blocks.append(m.group(1))
@@ -154,12 +219,20 @@ def _markdown_to_telegram_html(text: str) -> str:
 
 
 _SEND_MAX_RETRIES = 3
-_SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
+_SEND_RETRY_BASE_DELAY = 0.5
 
 
 @dataclass
 class _StreamBuf:
-    """Per-chat streaming accumulator for progressive message editing."""
+    """
+    每个聊天的流式累积缓冲区，用于渐进式消息编辑。
+
+    属性：
+        text: 累积的文本内容
+        message_id: 关联的消息 ID（用于编辑）
+        last_edit: 最近编辑的时间戳
+        stream_id: 流 ID（用于区分不同的流式响应）
+    """
     text: str = ""
     message_id: int | None = None
     last_edit: float = 0.0
@@ -167,7 +240,23 @@ class _StreamBuf:
 
 
 class TelegramConfig(Base):
-    """Telegram channel configuration."""
+    """
+    Telegram 频道配置模型。
+
+    属性：
+        enabled: 是否启用此频道
+        token: Telegram 机器人令牌
+        allow_from: 允许访问的用户 ID 列表
+        proxy: 代理服务器地址
+        reply_to_message: 是否回复原消息
+        react_emoji: 收到消息时的表情反应
+        group_policy: 群聊响应策略
+            - "open": 响应所有消息
+            - "mention": 仅在被 @ 提及时响应
+        connection_pool_size: HTTP 连接池大小
+        pool_timeout: 连接池超时时间（秒）
+        streaming: 是否启用流式输出
+    """
 
     enabled: bool = False
     token: str = ""
@@ -183,15 +272,18 @@ class TelegramConfig(Base):
 
 class TelegramChannel(BaseChannel):
     """
-    Telegram channel using long polling.
+    Telegram 频道实现，使用长轮询模式。
 
-    Simple and reliable - no webhook/public IP needed.
+    简单可靠 - 无需 Webhook 或公网 IP。
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
     """
 
     name = "telegram"
     display_name = "Telegram"
 
-    # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),

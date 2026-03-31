@@ -1,4 +1,31 @@
-"""WhatsApp channel implementation using Node.js bridge."""
+"""
+WhatsApp 频道实现，使用 Node.js 桥接。
+
+该模块实现了 nanobot 与 WhatsApp 的集成，支持：
+- 通过 WebSocket 与 Node.js 桥接进程通信
+- 支持 QR 码扫码登录
+- 支持文本和媒体消息
+- 支持群聊和私聊
+
+主要功能：
+    - WebSocket 桥接通信
+    - QR 码认证流程
+    - 媒体消息发送
+    - 群聊 @ 提及检测
+
+架构说明：
+    Python 频道 <--WebSocket--> Node.js 桥接 <--Baileys--> WhatsApp Web
+
+依赖：
+    - websockets: Python WebSocket 客户端
+    - @whiskeysockets/baileys: WhatsApp Web 协议库（Node.js）
+    - Node.js >= 18
+
+配置说明：
+    - bridge_url: 桥接 WebSocket 地址
+    - bridge_token: 桥接认证令牌
+    - group_policy: 群聊响应策略 ("open" 或 "mention")
+"""
 
 import asyncio
 import json
@@ -20,21 +47,36 @@ from nanobot.config.schema import Base
 
 
 class WhatsAppConfig(Base):
-    """WhatsApp channel configuration."""
+    """
+    WhatsApp 频道配置模型。
+
+    属性：
+        enabled: 是否启用此频道
+        bridge_url: 桥接 WebSocket 地址
+        bridge_token: 桥接认证令牌
+        allow_from: 允许访问的用户 ID 列表
+        group_policy: 群聊响应策略
+            - "open": 响应所有消息
+            - "mention": 仅在被 @ 提及时响应
+    """
 
     enabled: bool = False
     bridge_url: str = "ws://localhost:3001"
     bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
-    group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
+    group_policy: Literal["open", "mention"] = "open"
 
 
 class WhatsAppChannel(BaseChannel):
     """
-    WhatsApp channel that connects to a Node.js bridge.
+    WhatsApp 频道实现，连接到 Node.js 桥接。
 
-    The bridge uses @whiskeysockets/baileys to handle the WhatsApp Web protocol.
-    Communication between Python and Node.js is via WebSocket.
+    桥接使用 @whiskeysockets/baileys 处理 WhatsApp Web 协议。
+    Python 和 Node.js 之间通过 WebSocket 通信。
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
     """
 
     name = "whatsapp"

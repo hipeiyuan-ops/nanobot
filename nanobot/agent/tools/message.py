@@ -1,114 +1,137 @@
-"""Message tool for sending messages to users."""
+"""
+消息发送工具模块，允许 agent 向用户发送消息和媒体文件。
 
-from typing import Any, Awaitable, Callable
+该模块实现了 message 工具，是 agent 与用户通信的主要方式。
+支持：
+- 发送文本消息到指定频道
+- 发送媒体文件（图片、文档、音频、视频）
+- 指定消息格式（markdown、html 等）
+
+注意：这是 agent 主动发送消息的唯一方式。
+"""
+
+from pathlib import Path
+from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.queue import MessageBus
 
 
 class MessageTool(Tool):
-    """Tool to send messages to users on chat channels."""
+    """
+    消息发送工具，用于向用户发送消息和媒体文件。
 
-    def __init__(
-        self,
-        send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
-        default_channel: str = "",
-        default_chat_id: str = "",
-        default_message_id: str | None = None,
-    ):
-        self._send_callback = send_callback
-        self._default_channel = default_channel
-        self._default_chat_id = default_chat_id
-        self._default_message_id = default_message_id
-        self._sent_in_turn: bool = False
+    该工具是 agent 与用户通信的主要方式，支持：
+    - 发送文本消息
+    - 发送媒体文件（图片、文档、音频、视频）
+    - 指定消息格式
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-        """Set the current message context."""
-        self._default_channel = channel
-        self._default_chat_id = chat_id
-        self._default_message_id = message_id
+    Attributes:
+        _bus: 消息总线
+        _channel: 当前频道
+        _chat_id: 当前聊天 ID
+    """
 
-    def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
-        """Set the callback for sending messages."""
-        self._send_callback = callback
+    def __init__(self, bus: MessageBus, channel: str = "cli", chat_id: str = "direct"):
+        """
+        初始化消息工具。
 
-    def start_turn(self) -> None:
-        """Reset per-turn send tracking."""
-        self._sent_in_turn = False
+        Args:
+            bus: 消息总线，用于发送消息
+            channel: 当前频道名称
+            chat_id: 当前聊天 ID
+        """
+        self._bus = bus
+        self._channel = channel
+        self._chat_id = chat_id
+
+    def set_context(self, channel: str, chat_id: str) -> None:
+        """
+        设置当前会话上下文。
+
+        Args:
+            channel: 频道名称
+            chat_id: 聊天 ID
+        """
+        self._channel = channel
+        self._chat_id = chat_id
 
     @property
     def name(self) -> str:
+        """工具名称。"""
         return "message"
 
     @property
     def description(self) -> str:
+        """工具描述。"""
         return (
-            "Send a message to the user, optionally with file attachments. "
-            "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
-            "Do NOT use read_file to send files — that only reads content for your own analysis."
+            "Send a message to the user. Use this to send files (images, documents, audio, video). "
+            "For plain text replies, respond directly without calling this tool."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """工具参数的 JSON Schema。"""
         return {
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The message content to send"
-                },
-                "channel": {
-                    "type": "string",
-                    "description": "Optional: target channel (telegram, discord, etc.)"
-                },
-                "chat_id": {
-                    "type": "string",
-                    "description": "Optional: target chat/user ID"
+                    "description": "The message content (markdown supported)",
                 },
                 "media": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional: list of file paths to attach (images, audio, documents)"
-                }
+                    "description": "Optional list of media file paths to send (images, documents, audio, video)",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown", "html", "text"],
+                    "description": "Message format (default: markdown)",
+                },
             },
-            "required": ["content"]
+            "required": ["content"],
         }
 
     async def execute(
         self,
-        content: str,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        message_id: str | None = None,
+        content: str = "",
         media: list[str] | None = None,
-        **kwargs: Any
+        format: str = "markdown",
+        **kwargs: Any,
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+        """
+        执行消息发送。
 
-        if not channel or not chat_id:
-            return "Error: No target channel/chat specified"
+        Args:
+            content: 消息内容
+            media: 媒体文件路径列表
+            format: 消息格式（markdown、html、text）
 
-        if not self._send_callback:
-            return "Error: Message sending not configured"
+        Returns:
+            操作结果消息
+        """
+        if not content and not media:
+            return "Error: message content or media is required"
 
+        # 验证媒体文件是否存在
+        valid_media: list[str] | None = None
+        if media:
+            valid_media = []
+            for path_str in media:
+                p = Path(path_str).expanduser()
+                if not p.is_file():
+                    return f"Error: media file not found: {path_str}"
+                valid_media.append(str(p))
+
+        # 构建并发送消息
         msg = OutboundMessage(
-            channel=channel,
-            chat_id=chat_id,
+            channel=self._channel,
+            chat_id=self._chat_id,
             content=content,
-            media=media or [],
-            metadata={
-                "message_id": message_id,
-            },
+            media=valid_media,
+            format=format,
         )
-
-        try:
-            await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
-                self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
-            return f"Message sent to {channel}:{chat_id}{media_info}"
-        except Exception as e:
-            return f"Error sending message: {str(e)}"
+        await self._bus.publish_outbound(msg)
+        return "Message sent."

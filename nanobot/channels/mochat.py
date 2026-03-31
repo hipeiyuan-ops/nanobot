@@ -1,4 +1,31 @@
-"""Mochat channel implementation using Socket.IO with HTTP polling fallback."""
+"""
+Mochat 频道实现，使用 Socket.IO 和 HTTP 轮询回退机制。
+
+该模块实现了 nanobot 与 Mochat 平台的集成，支持：
+- Socket.IO 实时消息接收
+- HTTP 长轮询作为 WebSocket 不可用时的回退方案
+- 会话（Session）和面板（Panel）消息处理
+- 消息去重和延迟合并
+- 游标持久化，支持断点续传
+
+主要功能：
+    - 实时消息接收（WebSocket）
+    - HTTP 轮询回退模式
+    - 会话和面板自动发现
+    - 群聊消息延迟合并（减少噪音）
+    - @ 提及检测和响应策略
+
+依赖：
+    - python-socketio: Socket.IO 客户端
+    - msgpack: 高效二进制序列化（可选）
+
+配置说明：
+    - claw_token: Mochat Claw API 认证令牌
+    - base_url: Mochat 服务器地址
+    - sessions: 监听的会话 ID 列表（"*" 表示自动发现）
+    - panels: 监听的面板 ID 列表（"*" 表示自动发现）
+    - mention.require_in_groups: 群聊是否需要 @ 提及才响应
+"""
 
 from __future__ import annotations
 
@@ -27,7 +54,7 @@ except ImportError:
     SOCKETIO_AVAILABLE = False
 
 try:
-    import msgpack  # noqa: F401
+    import msgpack
     MSGPACK_AVAILABLE = True
 except ImportError:
     MSGPACK_AVAILABLE = False
@@ -36,13 +63,22 @@ MAX_SEEN_MESSAGE_IDS = 2000
 CURSOR_SAVE_DEBOUNCE_S = 0.5
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
 @dataclass
 class MochatBufferedEntry:
-    """Buffered inbound entry for delayed dispatch."""
+    """
+    延迟分发的缓冲入站条目。
+
+    用于群聊消息延迟合并，减少消息噪音。
+
+    属性：
+        raw_body: 原始消息内容
+        author: 作者 ID
+        sender_name: 发送者昵称
+        sender_username: 发送者用户名
+        timestamp: 消息时间戳（毫秒）
+        message_id: 消息 ID
+        group_id: 群组 ID
+    """
     raw_body: str
     author: str
     sender_name: str = ""
@@ -54,7 +90,16 @@ class MochatBufferedEntry:
 
 @dataclass
 class DelayState:
-    """Per-target delayed message state."""
+    """
+    每个目标的延迟消息状态。
+
+    用于管理群聊消息的延迟合并逻辑。
+
+    属性：
+        entries: 缓冲的消息条目列表
+        lock: 异步锁，保证线程安全
+        timer: 延迟刷新定时器任务
+    """
     entries: list[MochatBufferedEntry] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     timer: asyncio.Task | None = None
@@ -62,22 +107,24 @@ class DelayState:
 
 @dataclass
 class MochatTarget:
-    """Outbound target resolution result."""
+    """
+    出站目标解析结果。
+
+    属性：
+        id: 目标 ID（会话 ID 或面板 ID）
+        is_panel: 是否为面板目标
+    """
     id: str
     is_panel: bool
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
-
 def _safe_dict(value: Any) -> dict:
-    """Return *value* if it's a dict, else empty dict."""
+    """返回字典值，非字典返回空字典。"""
     return value if isinstance(value, dict) else {}
 
 
 def _str_field(src: dict, *keys: str) -> str:
-    """Return the first non-empty str value found for *keys*, stripped."""
+    """返回第一个非空字符串值（已去除首尾空白）。"""
     for k in keys:
         v = src.get(k)
         if isinstance(v, str) and v.strip():
@@ -90,7 +137,24 @@ def _make_synthetic_event(
     meta: Any, group_id: str, converse_id: str,
     timestamp: Any = None, *, author_info: Any = None,
 ) -> dict[str, Any]:
-    """Build a synthetic ``message.add`` event dict."""
+    """
+    构建合成的 message.add 事件字典。
+
+    用于将轮询获取的消息转换为事件格式。
+
+    参数：
+        message_id: 消息 ID
+        author: 作者 ID
+        content: 消息内容
+        meta: 元数据
+        group_id: 群组 ID
+        converse_id: 会话 ID
+        timestamp: 时间戳
+        author_info: 作者信息
+
+    返回：
+        合成的事件字典
+    """
     payload: dict[str, Any] = {
         "messageId": message_id, "author": author,
         "content": content, "meta": _safe_dict(meta),
@@ -106,7 +170,15 @@ def _make_synthetic_event(
 
 
 def normalize_mochat_content(content: Any) -> str:
-    """Normalize content payload to text."""
+    """
+    将内容载荷标准化为文本。
+
+    参数：
+        content: 原始内容（字符串、字典或其他）
+
+    返回：
+        标准化后的文本字符串
+    """
     if isinstance(content, str):
         return content.strip()
     if content is None:
@@ -118,7 +190,20 @@ def normalize_mochat_content(content: Any) -> str:
 
 
 def resolve_mochat_target(raw: str) -> MochatTarget:
-    """Resolve id and target kind from user-provided target string."""
+    """
+    从用户提供的目标字符串解析 ID 和目标类型。
+
+    支持的格式：
+        - "session_xxx": 会话目标
+        - "mochat:xxx": 去除前缀
+        - "group:xxx" / "channel:xxx" / "panel:xxx": 面板目标
+
+    参数：
+        raw: 原始目标字符串
+
+    返回：
+        MochatTarget 对象
+    """
     trimmed = (raw or "").strip()
     if not trimmed:
         return MochatTarget(id="", is_panel=False)
@@ -137,7 +222,15 @@ def resolve_mochat_target(raw: str) -> MochatTarget:
 
 
 def extract_mention_ids(value: Any) -> list[str]:
-    """Extract mention ids from heterogeneous mention payload."""
+    """
+    从异构的提及载荷中提取用户 ID。
+
+    参数：
+        value: 提及数据（列表或字典）
+
+    返回：
+        用户 ID 列表
+    """
     if not isinstance(value, list):
         return []
     ids: list[str] = []
@@ -155,7 +248,16 @@ def extract_mention_ids(value: Any) -> list[str]:
 
 
 def resolve_was_mentioned(payload: dict[str, Any], agent_user_id: str) -> bool:
-    """Resolve mention state from payload metadata and text fallback."""
+    """
+    从载荷元数据和文本回退解析提及状态。
+
+    参数：
+        payload: 消息载荷
+        agent_user_id: 机器人用户 ID
+
+    返回：
+        被 @ 提及返回 True
+    """
     meta = payload.get("meta")
     if isinstance(meta, dict):
         if meta.get("mentioned") is True or meta.get("wasMentioned") is True:
@@ -172,7 +274,17 @@ def resolve_was_mentioned(payload: dict[str, Any], agent_user_id: str) -> bool:
 
 
 def resolve_require_mention(config: MochatConfig, session_id: str, group_id: str) -> bool:
-    """Resolve mention requirement for group/panel conversations."""
+    """
+    解析群组/面板会话的提及要求。
+
+    参数：
+        config: Mochat 配置
+        session_id: 会话 ID
+        group_id: 群组 ID
+
+    返回：
+        需要 @ 提及才响应返回 True
+    """
     groups = config.groups or {}
     for key in (group_id, session_id, "*"):
         if key and key in groups:
@@ -181,7 +293,16 @@ def resolve_require_mention(config: MochatConfig, session_id: str, group_id: str
 
 
 def build_buffered_body(entries: list[MochatBufferedEntry], is_group: bool) -> str:
-    """Build text body from one or more buffered entries."""
+    """
+    从一个或多个缓冲条目构建文本正文。
+
+    参数：
+        entries: 缓冲条目列表
+        is_group: 是否为群聊
+
+    返回：
+        合并后的文本正文
+    """
     if not entries:
         return ""
     if len(entries) == 1:
@@ -200,7 +321,15 @@ def build_buffered_body(entries: list[MochatBufferedEntry], is_group: bool) -> s
 
 
 def parse_timestamp(value: Any) -> int | None:
-    """Parse event timestamp to epoch milliseconds."""
+    """
+    将事件时间戳解析为 epoch 毫秒。
+
+    参数：
+        value: 时间戳字符串
+
+    返回：
+        epoch 毫秒，解析失败返回 None
+    """
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -209,24 +338,46 @@ def parse_timestamp(value: Any) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Config classes
-# ---------------------------------------------------------------------------
-
 class MochatMentionConfig(Base):
-    """Mochat mention behavior configuration."""
+    """Mochat 提及行为配置。"""
 
     require_in_groups: bool = False
 
 
 class MochatGroupRule(Base):
-    """Mochat per-group mention requirement."""
+    """Mochat 每个群组的提及要求配置。"""
 
     require_mention: bool = False
 
 
 class MochatConfig(Base):
-    """Mochat channel configuration."""
+    """
+    Mochat 频道配置模型。
+
+    属性：
+        enabled: 是否启用此频道
+        base_url: Mochat 服务器基础 URL
+        socket_url: WebSocket 服务器 URL（默认使用 base_url）
+        socket_path: Socket.IO 路径
+        socket_disable_msgpack: 是否禁用 msgpack 序列化
+        socket_reconnect_delay_ms: 重连延迟（毫秒）
+        socket_max_reconnect_delay_ms: 最大重连延迟（毫秒）
+        socket_connect_timeout_ms: 连接超时（毫秒）
+        refresh_interval_ms: 刷新间隔（毫秒）
+        watch_timeout_ms: 长轮询超时（毫秒）
+        watch_limit: 单次获取消息数量限制
+        retry_delay_ms: 重试延迟（毫秒）
+        max_retry_attempts: 最大重试次数（0 表示无限）
+        claw_token: Claw API 认证令牌
+        agent_user_id: 机器人用户 ID（用于提及检测）
+        sessions: 监听的会话 ID 列表
+        panels: 监听的面板 ID 列表
+        allow_from: 允许访问的用户 ID 列表
+        mention: 提及配置
+        groups: 每个群组的规则配置
+        reply_delay_mode: 回复延迟模式
+        reply_delay_ms: 回复延迟时间（毫秒）
+    """
 
     enabled: bool = False
     base_url: str = "https://mochat.io"
@@ -252,21 +403,35 @@ class MochatConfig(Base):
     reply_delay_ms: int = 120000
 
 
-# ---------------------------------------------------------------------------
-# Channel
-# ---------------------------------------------------------------------------
-
 class MochatChannel(BaseChannel):
-    """Mochat channel using socket.io with fallback polling workers."""
+    """
+    Mochat 频道实现，使用 Socket.IO 和 HTTP 轮询回退。
+
+    支持两种运行模式：
+        - WebSocket 模式：实时接收消息
+        - HTTP 轮询模式：WebSocket 不可用时的回退方案
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
+    """
 
     name = "mochat"
     display_name = "Mochat"
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
+        """返回默认配置字典。"""
         return MochatConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
+        """
+        初始化 Mochat 频道实例。
+
+        参数：
+            config: 频道配置
+            bus: 消息总线实例
+        """
         if isinstance(config, dict):
             config = MochatConfig.model_validate(config)
         super().__init__(config, bus)
@@ -297,10 +462,20 @@ class MochatChannel(BaseChannel):
         self._refresh_task: asyncio.Task | None = None
         self._target_locks: dict[str, asyncio.Lock] = {}
 
-    # ---- lifecycle ---------------------------------------------------------
-
     async def start(self) -> None:
-        """Start Mochat channel workers and websocket connection."""
+        """
+        启动 Mochat 频道工作器和 WebSocket 连接。
+
+        启动流程：
+            1. 检查 claw_token 配置
+            2. 初始化 HTTP 客户端和状态目录
+            3. 加载会话游标
+            4. 从配置初始化目标列表
+            5. 刷新目标列表
+            6. 尝试启动 WebSocket 客户端
+            7. 如果 WebSocket 失败，启用 HTTP 轮询回退
+            8. 启动定期刷新循环
+        """
         if not self.config.claw_token:
             logger.error("Mochat claw_token not configured")
             return
@@ -320,7 +495,17 @@ class MochatChannel(BaseChannel):
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
-        """Stop all workers and clean up resources."""
+        """
+        停止所有工作器并清理资源。
+
+        停止流程：
+            1. 取消刷新任务
+            2. 停止回退工作器
+            3. 取消延迟定时器
+            4. 断开 WebSocket 连接
+            5. 保存会话游标
+            6. 关闭 HTTP 客户端
+        """
         self._running = False
         if self._refresh_task:
             self._refresh_task.cancel()
@@ -347,7 +532,17 @@ class MochatChannel(BaseChannel):
         self._ws_connected = self._ws_ready = False
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send outbound message to session or panel."""
+        """
+        发送出站消息到会话或面板。
+
+        参数：
+            msg: 出站消息对象
+
+        处理流程：
+            1. 合并内容和媒体
+            2. 解析目标类型（会话/面板）
+            3. 调用相应的 API 发送
+        """
         if not self.config.claw_token:
             logger.warning("Mochat claw_token missing, skip send")
             return
@@ -376,9 +571,8 @@ class MochatChannel(BaseChannel):
             logger.error("Failed to send Mochat message: {}", e)
             raise
 
-    # ---- config / init helpers ---------------------------------------------
-
     def _seed_targets_from_config(self) -> None:
+        """从配置初始化目标列表。"""
         sessions, self._auto_discover_sessions = self._normalize_id_list(self.config.sessions)
         panels, self._auto_discover_panels = self._normalize_id_list(self.config.panels)
         self._session_set.update(sessions)
@@ -389,12 +583,17 @@ class MochatChannel(BaseChannel):
 
     @staticmethod
     def _normalize_id_list(values: list[str]) -> tuple[list[str], bool]:
+        """标准化 ID 列表，返回 (清理后的列表, 是否自动发现)。"""
         cleaned = [str(v).strip() for v in values if str(v).strip()]
         return sorted({v for v in cleaned if v != "*"}), "*" in cleaned
 
-    # ---- websocket ---------------------------------------------------------
-
     async def _start_socket_client(self) -> bool:
+        """
+        启动 Socket.IO 客户端。
+
+        返回：
+            连接成功返回 True
+        """
         if not SOCKETIO_AVAILABLE:
             logger.warning("python-socketio not installed, Mochat using polling fallback")
             return False
@@ -468,6 +667,7 @@ class MochatChannel(BaseChannel):
             return False
 
     def _build_notify_handler(self, event_name: str):
+        """构建通知事件处理器。"""
         async def handler(payload: Any) -> None:
             if event_name == "notify:chat.inbox.append":
                 await self._handle_notify_inbox_append(payload)
@@ -475,9 +675,8 @@ class MochatChannel(BaseChannel):
                 await self._handle_notify_chat_message(payload)
         return handler
 
-    # ---- subscribe ---------------------------------------------------------
-
     async def _subscribe_all(self) -> bool:
+        """订阅所有会话和面板。"""
         ok = await self._subscribe_sessions(sorted(self._session_set))
         ok = await self._subscribe_panels(sorted(self._panel_set)) and ok
         if self._auto_discover_sessions or self._auto_discover_panels:
@@ -485,6 +684,7 @@ class MochatChannel(BaseChannel):
         return ok
 
     async def _subscribe_sessions(self, session_ids: list[str]) -> bool:
+        """订阅指定会话列表。"""
         if not session_ids:
             return True
         for sid in session_ids:
@@ -514,6 +714,7 @@ class MochatChannel(BaseChannel):
         return True
 
     async def _subscribe_panels(self, panel_ids: list[str]) -> bool:
+        """订阅指定面板列表。"""
         if not self._auto_discover_panels and not panel_ids:
             return True
         ack = await self._socket_call("com.claw.im.subscribePanels", {"panelIds": panel_ids})
@@ -523,6 +724,7 @@ class MochatChannel(BaseChannel):
         return True
 
     async def _socket_call(self, event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """调用 Socket.IO 方法并返回响应。"""
         if not self._socket:
             return {"result": False, "message": "socket not connected"}
         try:
@@ -531,9 +733,8 @@ class MochatChannel(BaseChannel):
             return {"result": False, "message": str(e)}
         return raw if isinstance(raw, dict) else {"result": True, "data": raw}
 
-    # ---- refresh / discovery -----------------------------------------------
-
     async def _refresh_loop(self) -> None:
+        """定期刷新目标列表的循环。"""
         interval_s = max(1.0, self.config.refresh_interval_ms / 1000.0)
         while self._running:
             await asyncio.sleep(interval_s)
@@ -545,12 +746,14 @@ class MochatChannel(BaseChannel):
                 await self._ensure_fallback_workers()
 
     async def _refresh_targets(self, subscribe_new: bool) -> None:
+        """刷新目标列表（会话和面板）。"""
         if self._auto_discover_sessions:
             await self._refresh_sessions_directory(subscribe_new)
         if self._auto_discover_panels:
             await self._refresh_panels(subscribe_new)
 
     async def _refresh_sessions_directory(self, subscribe_new: bool) -> None:
+        """刷新会话目录，发现新会话。"""
         try:
             response = await self._post_json("/api/claw/sessions/list", {})
         except Exception as e:
@@ -585,6 +788,7 @@ class MochatChannel(BaseChannel):
             await self._ensure_fallback_workers()
 
     async def _refresh_panels(self, subscribe_new: bool) -> None:
+        """刷新面板列表，发现新面板。"""
         try:
             response = await self._post_json("/api/claw/groups/get", {})
         except Exception as e:
@@ -614,9 +818,8 @@ class MochatChannel(BaseChannel):
         if self._fallback_mode:
             await self._ensure_fallback_workers()
 
-    # ---- fallback workers --------------------------------------------------
-
     async def _ensure_fallback_workers(self) -> None:
+        """确保回退工作器正在运行。"""
         if not self._running:
             return
         self._fallback_mode = True
@@ -630,6 +833,7 @@ class MochatChannel(BaseChannel):
                 self._panel_fallback_tasks[pid] = asyncio.create_task(self._panel_poll_worker(pid))
 
     async def _stop_fallback_workers(self) -> None:
+        """停止所有回退工作器。"""
         self._fallback_mode = False
         tasks = [*self._session_fallback_tasks.values(), *self._panel_fallback_tasks.values()]
         for t in tasks:
@@ -640,6 +844,7 @@ class MochatChannel(BaseChannel):
         self._panel_fallback_tasks.clear()
 
     async def _session_watch_worker(self, session_id: str) -> None:
+        """会话长轮询工作器（HTTP 回退模式）。"""
         while self._running and self._fallback_mode:
             try:
                 payload = await self._post_json("/api/claw/sessions/watch", {
@@ -654,6 +859,7 @@ class MochatChannel(BaseChannel):
                 await asyncio.sleep(max(0.1, self.config.retry_delay_ms / 1000.0))
 
     async def _panel_poll_worker(self, panel_id: str) -> None:
+        """面板轮询工作器（HTTP 回退模式）。"""
         sleep_s = max(1.0, self.config.refresh_interval_ms / 1000.0)
         while self._running and self._fallback_mode:
             try:
@@ -680,9 +886,8 @@ class MochatChannel(BaseChannel):
                 logger.warning("Mochat panel polling error ({}): {}", panel_id, e)
             await asyncio.sleep(sleep_s)
 
-    # ---- inbound event processing ------------------------------------------
-
     async def _handle_watch_payload(self, payload: dict[str, Any], target_kind: str) -> None:
+        """处理 watch 载荷（会话或面板事件）。"""
         if not isinstance(payload, dict):
             return
         target_id = _str_field(payload, "sessionId")
@@ -713,6 +918,7 @@ class MochatChannel(BaseChannel):
                     await self._process_inbound_event(target_id, event, target_kind)
 
     async def _process_inbound_event(self, target_id: str, event: dict[str, Any], target_kind: str) -> None:
+        """处理入站事件。"""
         payload = event.get("payload")
         if not isinstance(payload, dict):
             return
@@ -758,9 +964,8 @@ class MochatChannel(BaseChannel):
 
         await self._dispatch_entries(target_id, target_kind, [entry], was_mentioned)
 
-    # ---- dedup / buffering -------------------------------------------------
-
     def _remember_message_id(self, key: str, message_id: str) -> bool:
+        """记录已处理的消息 ID，用于去重。"""
         seen_set = self._seen_set.setdefault(key, set())
         seen_queue = self._seen_queue.setdefault(key, deque())
         if message_id in seen_set:
@@ -772,6 +977,7 @@ class MochatChannel(BaseChannel):
         return False
 
     async def _enqueue_delayed_entry(self, key: str, target_id: str, target_kind: str, entry: MochatBufferedEntry) -> None:
+        """将条目加入延迟队列。"""
         state = self._delay_states.setdefault(key, DelayState())
         async with state.lock:
             state.entries.append(entry)
@@ -780,10 +986,12 @@ class MochatChannel(BaseChannel):
             state.timer = asyncio.create_task(self._delay_flush_after(key, target_id, target_kind))
 
     async def _delay_flush_after(self, key: str, target_id: str, target_kind: str) -> None:
+        """延迟后刷新队列。"""
         await asyncio.sleep(max(0, self.config.reply_delay_ms) / 1000.0)
         await self._flush_delayed_entries(key, target_id, target_kind, "timer", None)
 
     async def _flush_delayed_entries(self, key: str, target_id: str, target_kind: str, reason: str, entry: MochatBufferedEntry | None) -> None:
+        """刷新延迟队列中的条目。"""
         state = self._delay_states.setdefault(key, DelayState())
         async with state.lock:
             if entry:
@@ -798,6 +1006,7 @@ class MochatChannel(BaseChannel):
             await self._dispatch_entries(target_id, target_kind, entries, reason == "mention")
 
     async def _dispatch_entries(self, target_id: str, target_kind: str, entries: list[MochatBufferedEntry], was_mentioned: bool) -> None:
+        """分发条目到消息总线。"""
         if not entries:
             return
         last = entries[-1]
@@ -815,14 +1024,14 @@ class MochatChannel(BaseChannel):
         )
 
     async def _cancel_delay_timers(self) -> None:
+        """取消所有延迟定时器。"""
         for state in self._delay_states.values():
             if state.timer:
                 state.timer.cancel()
         self._delay_states.clear()
 
-    # ---- notify handlers ---------------------------------------------------
-
     async def _handle_notify_chat_message(self, payload: Any) -> None:
+        """处理聊天消息通知。"""
         if not isinstance(payload, dict):
             return
         group_id = _str_field(payload, "groupId")
@@ -842,6 +1051,7 @@ class MochatChannel(BaseChannel):
         await self._process_inbound_event(panel_id, evt, "panel")
 
     async def _handle_notify_inbox_append(self, payload: Any) -> None:
+        """处理收件箱追加通知。"""
         if not isinstance(payload, dict) or payload.get("type") != "message":
             return
         detail = payload.get("payload")
@@ -869,9 +1079,8 @@ class MochatChannel(BaseChannel):
         )
         await self._process_inbound_event(session_id, evt, "session")
 
-    # ---- cursor persistence ------------------------------------------------
-
     def _mark_session_cursor(self, session_id: str, cursor: int) -> None:
+        """标记会话游标。"""
         if cursor < 0 or cursor < self._session_cursor.get(session_id, 0):
             return
         self._session_cursor[session_id] = cursor
@@ -879,10 +1088,12 @@ class MochatChannel(BaseChannel):
             self._cursor_save_task = asyncio.create_task(self._save_cursor_debounced())
 
     async def _save_cursor_debounced(self) -> None:
+        """防抖保存游标。"""
         await asyncio.sleep(CURSOR_SAVE_DEBOUNCE_S)
         await self._save_session_cursors()
 
     async def _load_session_cursors(self) -> None:
+        """从文件加载会话游标。"""
         if not self._cursor_path.exists():
             return
         try:
@@ -897,6 +1108,7 @@ class MochatChannel(BaseChannel):
                     self._session_cursor[sid] = cur
 
     async def _save_session_cursors(self) -> None:
+        """保存会话游标到文件。"""
         try:
             self._state_dir.mkdir(parents=True, exist_ok=True)
             self._cursor_path.write_text(json.dumps({
@@ -906,9 +1118,8 @@ class MochatChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to save Mochat cursor file: {}", e)
 
-    # ---- HTTP helpers ------------------------------------------------------
-
     async def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """发送 JSON POST 请求。"""
         if not self._http:
             raise RuntimeError("Mochat HTTP client not initialized")
         url = f"{self.config.base_url.strip().rstrip('/')}{path}"
@@ -931,7 +1142,7 @@ class MochatChannel(BaseChannel):
 
     async def _api_send(self, path: str, id_key: str, id_val: str,
                         content: str, reply_to: str | None, group_id: str | None = None) -> dict[str, Any]:
-        """Unified send helper for session and panel messages."""
+        """统一的发送辅助方法。"""
         body: dict[str, Any] = {id_key: id_val, "content": content}
         if reply_to:
             body["replyTo"] = reply_to
@@ -941,6 +1152,7 @@ class MochatChannel(BaseChannel):
 
     @staticmethod
     def _read_group_id(metadata: dict[str, Any]) -> str | None:
+        """从元数据读取群组 ID。"""
         if not isinstance(metadata, dict):
             return None
         value = metadata.get("group_id") or metadata.get("groupId")

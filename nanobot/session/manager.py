@@ -1,4 +1,21 @@
-"""Session management for conversation history."""
+"""
+会话管理模块，用于对话历史持久化。
+
+该模块实现了 nanobot 的会话管理功能：
+    - Session: 会话数据类，存储消息历史和元数据
+    - SessionManager: 会话管理器，处理会话的加载、保存和缓存
+
+会话特性：
+    - 消息只追加，保证 LLM 缓存效率
+    - 合并过程将摘要写入 MEMORY.md/HISTORY.md
+    - 不修改 messages 列表或 get_history() 输出
+    - 支持工具调用边界的合法性检查
+
+存储格式：
+    - JSONL 格式（每行一个 JSON 对象）
+    - 第一行为元数据（_type: "metadata"）
+    - 后续行为消息记录
+"""
 
 import json
 import shutil
@@ -16,24 +33,40 @@ from nanobot.utils.helpers import ensure_dir, safe_filename
 @dataclass
 class Session:
     """
-    A conversation session.
+    对话会话数据类。
 
-    Stores messages in JSONL format for easy reading and persistence.
+    以 JSONL 格式存储消息，便于阅读和持久化。
 
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    重要说明：
+        消息只追加以保证 LLM 缓存效率。
+        合并过程将摘要写入 MEMORY.md/HISTORY.md，
+        但不修改 messages 列表或 get_history() 输出。
+
+    属性：
+        key: 会话键（格式：channel:chat_id）
+        messages: 消息列表
+        created_at: 创建时间
+        updated_at: 更新时间
+        metadata: 会话元数据
+        last_consolidated: 已合并到文件的消息数量
     """
 
-    key: str  # channel:chat_id
+    key: str
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    last_consolidated: int = 0
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """
+        添加消息到会话。
+
+        参数：
+            role: 消息角色（user/assistant/tool）
+            content: 消息内容
+            **kwargs: 额外的消息字段
+        """
         msg = {
             "role": role,
             "content": content,
@@ -45,7 +78,18 @@ class Session:
 
     @staticmethod
     def _find_legal_start(messages: list[dict[str, Any]]) -> int:
-        """Find first index where every tool result has a matching assistant tool_call."""
+        """
+        查找第一个合法的起始索引，确保每个工具结果都有匹配的助手工具调用。
+
+        某些 Provider 会拒绝孤立的工具结果（如果匹配的助手 tool_calls
+        消息落在固定大小的历史窗口之外）。
+
+        参数：
+            messages: 消息列表
+
+        返回：
+            合法起始索引
+        """
         declared: set[str] = set()
         start = 0
         for i, msg in enumerate(messages):
@@ -67,18 +111,29 @@ class Session:
         return start
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
+        """
+        返回未合并的消息用于 LLM 输入，对齐到合法的工具调用边界。
+
+        参数：
+            max_messages: 最大返回消息数量
+
+        返回：
+            消息列表，每条消息包含 role、content 和可选的工具相关字段
+
+        处理流程：
+            1. 获取未合并的消息
+            2. 截取最近的消息
+            3. 跳过开头的非用户消息
+            4. 确保工具调用边界合法
+        """
         unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
-        # Drop leading non-user messages to avoid starting mid-turn when possible.
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 sliced = sliced[i:]
                 break
 
-        # Some providers reject orphan tool results if the matching assistant
-        # tool_calls message fell outside the fixed-size history window.
         start = self._find_legal_start(sliced)
         if start:
             sliced = sliced[start:]
@@ -93,13 +148,23 @@ class Session:
         return out
 
     def clear(self) -> None:
-        """Clear all messages and reset session to initial state."""
+        """清空所有消息并重置会话到初始状态。"""
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
-        """Keep a legal recent suffix, mirroring get_history boundary rules."""
+        """
+        保留合法的最近消息后缀，镜像 get_history 边界规则。
+
+        参数：
+            max_messages: 最大保留消息数量
+
+        处理流程：
+            1. 从末尾开始截取
+            2. 如果截断点在对话中间，向后扩展到最近的用户轮次
+            3. 确保工具调用边界合法
+        """
         if max_messages <= 0:
             self.clear()
             return
@@ -108,13 +173,11 @@ class Session:
 
         start_idx = max(0, len(self.messages) - max_messages)
 
-        # If the cutoff lands mid-turn, extend backward to the nearest user turn.
         while start_idx > 0 and self.messages[start_idx].get("role") != "user":
             start_idx -= 1
 
         retained = self.messages[start_idx:]
 
-        # Mirror get_history(): avoid persisting orphan tool results at the front.
         start = self._find_legal_start(retained)
         if start:
             retained = retained[start:]
@@ -127,36 +190,64 @@ class Session:
 
 class SessionManager:
     """
-    Manages conversation sessions.
+    会话管理器，处理会话的加载、保存和缓存。
 
-    Sessions are stored as JSONL files in the sessions directory.
+    会话以 JSONL 文件格式存储在 sessions 目录中。
+
+    属性：
+        workspace: 工作区路径
+        sessions_dir: 会话存储目录
+        legacy_sessions_dir: 旧版会话目录（用于迁移）
+        _cache: 内存会话缓存
     """
 
     def __init__(self, workspace: Path):
+        """
+        初始化会话管理器。
+
+        参数：
+            workspace: 工作区根目录路径
+        """
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
 
     def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
+        """
+        获取会话文件路径。
+
+        参数：
+            key: 会话键
+
+        返回：
+            会话文件路径
+        """
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
-        """Legacy global session path (~/.nanobot/sessions/)."""
+        """
+        获取旧版全局会话路径（~/.nanobot/sessions/）。
+
+        参数：
+            key: 会话键
+
+        返回：
+            旧版会话文件路径
+        """
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
 
     def get_or_create(self, key: str) -> Session:
         """
-        Get an existing session or create a new one.
+        获取现有会话或创建新会话。
 
-        Args:
-            key: Session key (usually channel:chat_id).
+        参数：
+            key: 会话键（通常是 channel:chat_id）
 
-        Returns:
-            The session.
+        返回：
+            会话对象
         """
         if key in self._cache:
             return self._cache[key]
@@ -169,7 +260,20 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """
+        从磁盘加载会话。
+
+        参数：
+            key: 会话键
+
+        返回：
+            会话对象，不存在返回 None
+
+        处理流程：
+            1. 检查新版路径
+            2. 如果不存在，尝试从旧版路径迁移
+            3. 解析 JSONL 文件
+        """
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
@@ -216,7 +320,15 @@ class SessionManager:
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """
+        保存会话到磁盘。
+
+        参数：
+            session: 要保存的会话对象
+
+        存储格式：
+            第一行为元数据，后续行为消息记录
+        """
         path = self._get_session_path(session.key)
 
         with open(path, "w", encoding="utf-8") as f:
@@ -235,21 +347,25 @@ class SessionManager:
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
-        """Remove a session from the in-memory cache."""
+        """
+        从内存缓存中移除会话。
+
+        参数：
+            key: 会话键
+        """
         self._cache.pop(key, None)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
-        List all sessions.
+        列出所有会话。
 
-        Returns:
-            List of session info dicts.
+        返回：
+            会话信息字典列表，按更新时间降序排列
         """
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
                 with open(path, encoding="utf-8") as f:
                     first_line = f.readline().strip()
                     if first_line:

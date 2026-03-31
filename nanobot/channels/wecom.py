@@ -1,4 +1,27 @@
-"""WeCom (Enterprise WeChat) channel implementation using wecom_aibot_sdk."""
+"""
+企业微信频道实现，使用 wecom_aibot_sdk。
+
+该模块实现了 nanobot 与企业微信 AI 机器人的集成，支持：
+- 通过 WebSocket 长连接接收消息（无需公网 IP）
+- 支持文本、图片、语音、文件、混合消息
+- 支持消息回复（流式消息）
+- 支持媒体文件下载和解密
+
+主要功能：
+    - WebSocket 长连接消息接收
+    - 多种消息类型处理
+    - 媒体文件下载和解密
+    - 流式消息回复
+    - 欢迎消息发送
+
+依赖：
+    - wecom_aibot_sdk: 企业微信 AI 机器人 SDK
+
+配置说明：
+    - bot_id: 企业微信机器人 ID
+    - secret: 企业微信机器人密钥
+    - welcome_message: 用户进入聊天时的欢迎消息
+"""
 
 import asyncio
 import importlib.util
@@ -18,7 +41,16 @@ from pydantic import Field
 WECOM_AVAILABLE = importlib.util.find_spec("wecom_aibot_sdk") is not None
 
 class WecomConfig(Base):
-    """WeCom (Enterprise WeChat) AI Bot channel configuration."""
+    """
+    企业微信 AI 机器人频道配置模型。
+
+    属性：
+        enabled: 是否启用此频道
+        bot_id: 企业微信机器人 ID
+        secret: 企业微信机器人密钥
+        allow_from: 允许访问的用户 ID 列表
+        welcome_message: 用户进入聊天时的欢迎消息
+    """
 
     enabled: bool = False
     bot_id: str = ""
@@ -27,7 +59,6 @@ class WecomConfig(Base):
     welcome_message: str = ""
 
 
-# Message type display mapping
 MSG_TYPE_MAP = {
     "image": "[image]",
     "voice": "[voice]",
@@ -38,12 +69,16 @@ MSG_TYPE_MAP = {
 
 class WecomChannel(BaseChannel):
     """
-    WeCom (Enterprise WeChat) channel using WebSocket long connection.
+    企业微信频道实现，使用 WebSocket 长连接。
 
-    Uses WebSocket to receive events - no public IP or webhook required.
+    通过 WebSocket 接收事件消息，无需公网 IP 或 Webhook。
 
-    Requires:
-    - Bot ID and Secret from WeCom AI Bot platform
+    要求：
+        - 企业微信 AI 机器人平台的 Bot ID 和 Secret
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
     """
 
     name = "wecom"

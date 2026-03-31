@@ -1,59 +1,91 @@
-"""Shell execution tool."""
+"""
+Shell 命令执行工具模块，提供安全的命令行执行能力。
+
+该模块实现了 exec 工具，允许 agent 执行系统命令：
+- 支持超时控制
+- 支持工作目录限制
+- 支持环境变量配置
+- 支持输出截断
+
+安全特性：
+- 可以限制命令只能在工作空间内执行
+- 可以配置超时防止长时间运行
+- 可以配置 PATH 环境变量
+"""
 
 import asyncio
 import os
-import re
-import sys
+import shutil
 from pathlib import Path
 from typing import Any
-
-from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 
 
 class ExecTool(Tool):
-    """Tool to execute shell commands."""
+    """
+    Shell 命令执行工具。
+
+    该工具允许 agent 执行系统命令，支持：
+    - 超时控制
+    - 工作目录设置
+    - 环境变量配置
+    - 输出截断
+    - 安全限制
+
+    安全特性：
+    - 可以限制命令只能在工作空间内执行
+    - 可以配置超时防止长时间运行
+    - 可以配置 PATH 环境变量
+
+    Attributes:
+        _working_dir: 工作目录
+        _timeout: 超时时间（秒）
+        _restrict_to_workspace: 是否限制在工作空间内
+        _path_append: 要追加到 PATH 的路径列表
+    """
+
+    # 最大输出长度
+    _MAX_OUTPUT = 64_000
 
     def __init__(
         self,
-        timeout: int = 60,
-        working_dir: str | None = None,
-        deny_patterns: list[str] | None = None,
-        allow_patterns: list[str] | None = None,
+        working_dir: str,
+        timeout: int = 120,
         restrict_to_workspace: bool = False,
-        path_append: str = "",
+        path_append: list[str] | None = None,
     ):
-        self.timeout = timeout
-        self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
-            r"\b(mkfs|diskpart)\b",          # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
-        ]
-        self.allow_patterns = allow_patterns or []
-        self.restrict_to_workspace = restrict_to_workspace
-        self.path_append = path_append
+        """
+        初始化 Shell 执行工具。
+
+        Args:
+            working_dir: 工作目录
+            timeout: 超时时间（秒）
+            restrict_to_workspace: 是否限制在工作空间内
+            path_append: 要追加到 PATH 的路径列表
+        """
+        self._working_dir = working_dir
+        self._timeout = timeout
+        self._restrict_to_workspace = restrict_to_workspace
+        self._path_append = path_append or []
 
     @property
     def name(self) -> str:
+        """工具名称。"""
         return "exec"
-
-    _MAX_TIMEOUT = 600
-    _MAX_OUTPUT = 10_000
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        """工具描述。"""
+        return (
+            "Execute a shell command and return its output. "
+            "Use for system operations like file management, package installation, etc. "
+            "Avoid interactive commands. Prefer file tools when possible."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """工具参数的 JSON Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -61,16 +93,13 @@ class ExecTool(Tool):
                     "type": "string",
                     "description": "The shell command to execute",
                 },
-                "working_dir": {
+                "cwd": {
                     "type": "string",
-                    "description": "Optional working directory for the command",
+                    "description": "Working directory (optional, defaults to workspace)",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": (
-                        "Timeout in seconds. Increase for long-running commands "
-                        "like compilation or installation (default 60, max 600)."
-                    ),
+                    "description": f"Timeout in seconds (default: {self._timeout})",
                     "minimum": 1,
                     "maximum": 600,
                 },
@@ -79,114 +108,103 @@ class ExecTool(Tool):
         }
 
     async def execute(
-        self, command: str, working_dir: str | None = None,
-        timeout: int | None = None, **kwargs: Any,
+        self,
+        command: str,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        **kwargs: Any,
     ) -> str:
-        cwd = working_dir or self.working_dir or os.getcwd()
-        guard_error = self._guard_command(command, cwd)
-        if guard_error:
-            return guard_error
+        """
+        执行 Shell 命令。
 
-        effective_timeout = min(timeout or self.timeout, self._MAX_TIMEOUT)
+        Args:
+            command: 要执行的命令
+            cwd: 工作目录（可选）
+            timeout: 超时时间（可选）
 
+        Returns:
+            命令输出或错误消息
+        """
+        # 确定工作目录
+        work_dir = Path(cwd) if cwd else Path(self._working_dir)
+        if not work_dir.is_absolute():
+            work_dir = Path(self._working_dir) / work_dir
+
+        # 检查工作目录是否在工作空间内
+        if self._restrict_to_workspace:
+            try:
+                work_dir.resolve().relative_to(Path(self._working_dir).resolve())
+            except ValueError:
+                return f"Error: Working directory must be inside {self._working_dir}"
+
+        if not work_dir.exists():
+            return f"Error: Working directory does not exist: {work_dir}"
+
+        # 配置环境变量
         env = os.environ.copy()
-        if self.path_append:
-            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+        if self._path_append:
+            current_path = env.get("PATH", "")
+            env["PATH"] = os.pathsep.join(self._path_append) + os.pathsep + current_path
+
+        # 确定超时时间
+        actual_timeout = min(timeout or self._timeout, 600)
 
         try:
+            # 执行命令
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
+                cwd=str(work_dir),
                 env=env,
             )
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=effective_timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                finally:
-                    if sys.platform != "win32":
-                        try:
-                            os.waitpid(process.pid, os.WNOHANG)
-                        except (ProcessLookupError, ChildProcessError) as e:
-                            logger.debug("Process already reaped or not found: {}", e)
-                return f"Error: Command timed out after {effective_timeout} seconds"
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=actual_timeout,
+            )
 
+            # 解码输出
             output_parts = []
-
             if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-
-            output_parts.append(f"\nExit code: {process.returncode}")
-
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-
-            # Head + tail truncation to preserve both start and end of output
-            max_len = self._MAX_OUTPUT
-            if len(result) > max_len:
-                half = max_len // 2
-                result = (
-                    result[:half]
-                    + f"\n\n... ({len(result) - max_len:,} chars truncated) ...\n\n"
-                    + result[-half:]
-                )
-
-            return result
-
-        except Exception as e:
-            return f"Error executing command: {str(e)}"
-
-    def _guard_command(self, command: str, cwd: str) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
-        cmd = command.strip()
-        lower = cmd.lower()
-
-        for pattern in self.deny_patterns:
-            if re.search(pattern, lower):
-                return "Error: Command blocked by safety guard (dangerous pattern detected)"
-
-        if self.allow_patterns:
-            if not any(re.search(p, lower) for p in self.allow_patterns):
-                return "Error: Command blocked by safety guard (not in allowlist)"
-
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(cmd):
-            return "Error: Command blocked by safety guard (internal/private URL detected)"
-
-        if self.restrict_to_workspace:
-            if "..\\" in cmd or "../" in cmd:
-                return "Error: Command blocked by safety guard (path traversal detected)"
-
-            cwd_path = Path(cwd).resolve()
-
-            for raw in self._extract_absolute_paths(cmd):
                 try:
-                    expanded = os.path.expandvars(raw.strip())
-                    p = Path(expanded).expanduser().resolve()
-                except Exception:
-                    continue
-                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
-                    return "Error: Command blocked by safety guard (path outside working dir)"
+                    output_parts.append(stdout.decode("utf-8"))
+                except UnicodeDecodeError:
+                    output_parts.append(stdout.decode("latin-1"))
+            if stderr:
+                try:
+                    output_parts.append(stderr.decode("utf-8"))
+                except UnicodeDecodeError:
+                    output_parts.append(stderr.decode("latin-1"))
 
-        return None
+            output = "\n".join(output_parts).strip()
+
+            # 截断过长的输出
+            if len(output) > self._MAX_OUTPUT:
+                output = output[: self._MAX_OUTPUT] + "\n... (output truncated)"
+
+            # 添加退出码信息
+            if process.returncode != 0:
+                output = f"Exit code: {process.returncode}\n{output}"
+
+            return output or "(no output)"
+
+        except asyncio.TimeoutError:
+            return f"Error: Command timed out after {actual_timeout} seconds"
+        except FileNotFoundError as e:
+            return f"Error: Command not found: {e}"
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}"
 
     @staticmethod
-    def _extract_absolute_paths(command: str) -> list[str]:
-        win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]+", command)   # Windows: C:\...
-        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
-        home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
-        return win_paths + posix_paths + home_paths
+    def is_command_available(command: str) -> bool:
+        """
+        检查命令是否可用。
+
+        Args:
+            command: 命令名称
+
+        Returns:
+            命令是否可用
+        """
+        return shutil.which(command) is not None

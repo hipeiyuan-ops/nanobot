@@ -1,10 +1,33 @@
-"""Personal WeChat (微信) channel using HTTP long-poll API.
+"""
+个人微信频道实现，使用 HTTP 长轮询 API。
 
-Uses the ilinkai.weixin.qq.com API for personal WeChat messaging.
-No WebSocket, no local WeChat client needed — just HTTP requests with a
-bot token obtained via QR code login.
+该模块实现了 nanobot 与个人微信的集成，支持：
+- 通过 HTTP 长轮询接收消息（无需 WebSocket 或本地微信客户端）
+- 支持 QR 码扫码登录
+- 支持文本、图片、语音、文件、视频消息
+- 支持媒体文件下载和上传（AES 加密/解密）
+- 支持打字指示器
 
-Protocol reverse-engineered from ``@tencent-weixin/openclaw-weixin`` v1.0.3.
+主要功能：
+    - HTTP 长轮询消息接收
+    - QR 码扫码登录流程
+    - 媒体文件 AES-128-ECB 加密/解密
+    - 打字状态指示器
+    - 会话状态持久化
+    - 引用消息处理
+
+协议说明：
+    协议逆向自 @tencent-weixin/openclaw-weixin v1.0.3
+
+依赖：
+    - httpx: 异步 HTTP 客户端
+    - pycryptodome 或 cryptography: AES 加密/解密
+
+配置说明：
+    - base_url: API 服务器地址
+    - token: 机器人令牌（通过 QR 登录获取）
+    - state_dir: 状态持久化目录
+    - poll_timeout: 长轮询超时时间（秒）
 """
 
 from __future__ import annotations
@@ -114,25 +137,40 @@ def _has_downloadable_media_locator(media: dict[str, Any] | None) -> bool:
 
 
 class WeixinConfig(Base):
-    """Personal WeChat channel configuration."""
+    """
+    个人微信频道配置模型。
+
+    属性：
+        enabled: 是否启用此频道
+        allow_from: 允许访问的用户 ID 列表
+        base_url: API 服务器地址
+        cdn_base_url: CDN 服务器地址
+        route_tag: 路由标签（可选）
+        token: 机器人令牌（手动设置或通过 QR 登录获取）
+        state_dir: 状态持久化目录（默认 ~/.nanobot/weixin/）
+        poll_timeout: 长轮询超时时间（秒）
+    """
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
     base_url: str = "https://ilinkai.weixin.qq.com"
     cdn_base_url: str = "https://novac2c.cdn.weixin.qq.com/c2c"
     route_tag: str | int | None = None
-    token: str = ""  # Manually set token, or obtained via QR login
-    state_dir: str = ""  # Default: ~/.nanobot/weixin/
-    poll_timeout: int = DEFAULT_LONG_POLL_TIMEOUT_S  # seconds for long-poll
+    token: str = ""
+    state_dir: str = ""
+    poll_timeout: int = DEFAULT_LONG_POLL_TIMEOUT_S
 
 
 class WeixinChannel(BaseChannel):
     """
-    Personal WeChat channel using HTTP long-poll.
+    个人微信频道实现，使用 HTTP 长轮询。
 
-    Connects to ilinkai.weixin.qq.com API to receive and send personal
-    WeChat messages. Authentication is via QR code login which produces
-    a bot token.
+    连接 ilinkai.weixin.qq.com API 接收和发送个人微信消息。
+    通过 QR 码扫码登录获取机器人令牌进行认证。
+
+    属性：
+        name: 频道标识符
+        display_name: 频道显示名称
     """
 
     name = "weixin"
