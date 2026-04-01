@@ -1,16 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "node",
-    "esModuleInterop": true,
-    "strict": true,
-    "skipLibCheck": true,
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "declaration": true,
-    "resolveJsonModule": true
+    "target": "ES2022", // 编译成什么版本JS
+    "module": "ESNext", // 模块化系统
+    "moduleResolution": "node",  //按 Node 规则找包
+    "esModuleInterop": true,     //让 TS 能兼容老的 JS 模块
+    "strict": true,     // 开启严格类型检查（推荐）
+    "skipLibCheck": true,        //跳过对第三方库（.d.ts）的类型检查
+    "outDir": "./dist", // 编译后的JS放这里
+    "rootDir": "./src", // 你的TS代码在这里
+    "declaration": true,         //自动生成 .d.ts 类型文件
+    "resolveJsonModule": true    //允许你在 TS 里直接 import JSON 文件
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*"],  // 要编译的文件夹
+  "exclude": ["node_modules", "dist"]  // 忽略的文件夹
 }
